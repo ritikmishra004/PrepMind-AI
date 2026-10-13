@@ -1,22 +1,14 @@
+"""REST API endpoints for the AI Interview Coach.
 
-"""
-routes.py — REST API endpoints for AI Interview Coach.
-
-The React frontend communicates with these endpoints through HTTP.
-FastAPI validates requests using Pydantic schemas.
-
-This module connects:
-- Question bank
-- SQLite persistence
-- Local LangChain + LangGraph evaluation
-- Interview progress and history
-
-The LLM runs locally through Ollama. Only optional search queries
-are sent to the external search provider.
+The API exposes a compact set of main subjects while preserving the detailed
+subtopic on every question. Coding Questions is reserved for DSA problems only;
+Python, SQL, RAG, LLM, and MCP implementation questions stay under their own
+subjects.
 """
 
 import json
 import logging
+import random
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -32,6 +24,7 @@ from app.database import (
 )
 from app.schemas import (
     DashboardStats,
+    EvaluationResponse,
     InterviewHistoryResponse,
     InterviewSummary,
     MessageResponse,
@@ -39,21 +32,95 @@ from app.schemas import (
     StartInterviewResponse,
     SubmitAnswerRequest,
     SubmitAnswerResponse,
-    EvaluationResponse,
 )
 from app.services.interview_agent import evaluate_candidate_answer
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api", tags=["Interview Coach"])
 
 
-# ---------------------------------------------------------
-# Question-bank helpers
-# ---------------------------------------------------------
+# These are the only subject cards the frontend should display.
+MAIN_TOPICS = [
+    "RAG",
+    "Agentic AI",
+    "Generative AI",
+    "LLM",
+    "AI Engineering",
+    "MCP",
+    "Operating System",
+    "Computer Networks",
+    "Python",
+    "Coding Questions",
+    "Machine Learning",
+    "Deep Learning",
+    "NLP",
+    "SQL",
+]
+
+# These topic labels in the `coding_*` group represent DSA problem families.
+# Other coding_* entries (Python basics, SQL, and general practical coding) do
+# not go into the Coding Questions section.
+DSA_SUBTOPICS = {
+    "strings",
+    "arrays",
+    "hash maps and sets",
+    "two pointers and sliding window",
+    "linked lists",
+    "stacks and queues",
+    "searching and sorting",
+    "recursion and backtracking",
+    "binary trees and bst",
+    "graphs",
+    "dynamic programming",
+}
+
+# The uploaded bank has detailed Statistics questions but no separate
+# machine-learning ID group. To keep the requested fixed set of main subjects,
+# these foundational questions are grouped under Machine Learning.
+QUESTION_ID_PREFIX_TO_MAIN_TOPIC = {
+    "rag": "RAG",
+    "agenticai": "Agentic AI",
+    "llmgenai": "Generative AI",
+    "llm": "LLM",
+    "aieng": "AI Engineering",
+    "mcp": "MCP",
+    "os": "Operating System",
+    "networking": "Computer Networks",
+    "python": "Python",
+    "statistics": "Machine Learning",
+    "deeplearning": "Deep Learning",
+    "nlp": "NLP",
+}
+
+
+def canonical_topic(item: dict[str, Any]) -> str | None:
+    """Return the compact main subject for a question, or None if unmapped."""
+    question_id = str(item.get("question_id", "")).strip().casefold()
+    original_topic = str(item.get("topic", "")).strip()
+    normalized_topic = original_topic.casefold()
+
+    # Special handling for the separate coding collection.
+    if question_id.startswith("coding_"):
+        if normalized_topic in DSA_SUBTOPICS:
+            return "Coding Questions"
+        if normalized_topic == "sql coding" or "sql" in normalized_topic:
+            return "SQL"
+        if normalized_topic == "python fundamentals":
+            return "Python"
+        if normalized_topic == "practical coding and debugging":
+            # coding_099 is a Python data-cleaning implementation problem;
+            # coding_100 is an API rate-limiter design problem.
+            if question_id == "coding_100":
+                return "AI Engineering"
+            return "Python"
+        return None
+
+    prefix = question_id.split("_", maxsplit=1)[0]
+    return QUESTION_ID_PREFIX_TO_MAIN_TOPIC.get(prefix)
+
 
 def load_question_bank() -> list[dict[str, Any]]:
-    """Load the locally stored question-only JSON bank."""
+    """Load and validate the local question-only JSON bank."""
     if not QUESTION_BANK_PATH.exists():
         raise HTTPException(
             status_code=500,
@@ -82,8 +149,7 @@ def load_question_bank() -> list[dict[str, Any]]:
             detail="Question bank must contain a list of questions.",
         )
 
-    valid_questions = []
-
+    valid_questions: list[dict[str, Any]] = []
     for index, item in enumerate(raw_data):
         if not isinstance(item, dict):
             continue
@@ -92,25 +158,28 @@ def load_question_bank() -> list[dict[str, Any]]:
         topic = item.get("topic")
         difficulty = item.get("difficulty", "Medium")
         question_id = item.get("question_id", f"q{index + 1}")
+        question_type = item.get("question_type", "conceptual")
 
         if not isinstance(question, str) or not question.strip():
             continue
-
         if not isinstance(topic, str) or not topic.strip():
             continue
-
         if difficulty not in ("Easy", "Medium", "Hard"):
             difficulty = "Medium"
+        if not isinstance(question_type, str) or not question_type.strip():
+            question_type = "conceptual"
 
-        valid_questions.append(
-            {
-                "question_id": str(question_id),
-                "topic": topic.strip(),
-                "difficulty": difficulty,
-                "question": question.strip(),
-                "question_type": item.get("question_type", "conceptual"),
-            }
-        )
+        normalized_item = {
+            "question_id": str(question_id),
+            # Keep the detailed subtopic; the canonical main topic is computed
+            # separately so no source information is lost.
+            "topic": topic.strip(),
+            "difficulty": difficulty,
+            "question": question.strip(),
+            "question_type": question_type.strip(),
+        }
+        normalized_item["main_topic"] = canonical_topic(normalized_item)
+        valid_questions.append(normalized_item)
 
     if not valid_questions:
         raise HTTPException(
@@ -122,7 +191,7 @@ def load_question_bank() -> list[dict[str, Any]]:
 
 
 def public_question(item: dict[str, Any]) -> dict[str, str]:
-    """Expose only fields required by the interview frontend."""
+    """Expose the original subtopic with the question shown to the candidate."""
     return {
         "question_id": str(item["question_id"]),
         "topic": str(item["topic"]),
@@ -132,18 +201,66 @@ def public_question(item: dict[str, Any]) -> dict[str, str]:
     }
 
 
-# ---------------------------------------------------------
-# In-memory active-session state
-# ---------------------------------------------------------
-#
-# SQLite persists interview records and answers.
-# This dictionary tracks which questions belong to an active session.
-#
-# It is suitable for a single local development server. For a
-# multi-worker or production deployment, move session progress into
-# persistent storage (or another shared session store).
-
+# SQLite stores interview history and answers. This dictionary tracks the
+# question order for active sessions in this single local development server.
 active_sessions: dict[int, dict[str, Any]] = {}
+
+# Remember recent randomized starts for each subject/difficulty in this process.
+# This prevents the first question from repeating across consecutive practice
+# sessions (when the selected set contains more than one question).
+recent_first_question_ids: dict[tuple[str, str], list[str]] = {}
+last_question_orders: dict[tuple[str, str], tuple[str, ...]] = {}
+
+
+def randomize_question_order(
+    questions: list[dict[str, Any]],
+    topic: str,
+    difficulty: str,
+) -> list[dict[str, Any]]:
+    """Shuffle a fresh copy, avoiding recently repeated opening questions.
+
+    All selected questions still appear exactly once in each session. This is
+    ordering from the question bank, not LLM-generated question content.
+    """
+    shuffled = list(questions)
+    if len(shuffled) <= 1:
+        return shuffled
+
+    rng = random.SystemRandom()
+    rng.shuffle(shuffled)
+    key = (topic.casefold(), difficulty.casefold())
+
+    # Avoid repeating the exact same full order in back-to-back sessions.
+    previous_order = last_question_orders.get(key)
+    current_order = tuple(str(item["question_id"]) for item in shuffled)
+    if current_order == previous_order:
+        shuffled.append(shuffled.pop(0))
+
+    # Avoid repeating one of the recent opening questions, if possible.
+    recent_firsts = recent_first_question_ids.setdefault(key, [])
+    recent_first_set = set(recent_firsts)
+    if str(shuffled[0]["question_id"]) in recent_first_set:
+        alternatives = [
+            index for index in range(1, len(shuffled))
+            if str(shuffled[index]["question_id"]) not in recent_first_set
+        ]
+        if alternatives:
+            swap_index = rng.choice(alternatives)
+            shuffled[0], shuffled[swap_index] = shuffled[swap_index], shuffled[0]
+        else:
+            # If recent history covers the whole set, clear it and still avoid
+            # repeating the immediately previous first question.
+            previous_first = recent_firsts[-1] if recent_firsts else None
+            recent_firsts.clear()
+            if str(shuffled[0]["question_id"]) == previous_first:
+                rng_index = rng.randrange(1, len(shuffled))
+                shuffled[0], shuffled[rng_index] = shuffled[rng_index], shuffled[0]
+
+    first_id = str(shuffled[0]["question_id"])
+    recent_firsts.append(first_id)
+    del recent_firsts[:-5]  # Retain the last five first questions per quiz.
+    last_question_orders[key] = tuple(str(item["question_id"]) for item in shuffled)
+    return shuffled
 
 
 # ---------------------------------------------------------
@@ -158,28 +275,33 @@ def health_check() -> dict[str, str]:
 
 @router.get("/topics")
 def get_topics() -> dict[str, list[str]]:
-    """Return topics available in the question bank."""
+    """Return only the configured main subject categories, in display order."""
     questions = load_question_bank()
-    topics = sorted({item["topic"] for item in questions})
-    return {"topics": topics}
+    available = {item.get("main_topic") for item in questions}
+    return {"topics": [topic for topic in MAIN_TOPICS if topic in available]}
 
 
 @router.get("/question-counts")
 def get_question_counts() -> dict[str, Any]:
-    """Return available counts for each topic and difficulty."""
+    """Count questions by main topic and difficulty, not by subtopic."""
     questions = load_question_bank()
-    counts: dict[str, dict[str, int]] = {}
+    counts: dict[str, dict[str, int]] = {
+        topic: {"Easy": 0, "Medium": 0, "Hard": 0}
+        for topic in MAIN_TOPICS
+    }
 
     for item in questions:
-        topic = item["topic"]
-        difficulty = item["difficulty"]
+        topic = item.get("main_topic")
+        if topic not in counts:
+            continue
+        counts[topic][item["difficulty"]] += 1
 
-        counts.setdefault(
-            topic,
-            {"Easy": 0, "Medium": 0, "Hard": 0},
-        )
-        counts[topic][difficulty] += 1
-
+    # Omit categories that have no questions in the loaded bank.
+    counts = {
+        topic: by_difficulty
+        for topic, by_difficulty in counts.items()
+        if sum(by_difficulty.values()) > 0
+    }
     return {"counts": counts}
 
 
@@ -199,7 +321,6 @@ def list_interviews(
 ) -> dict[str, Any]:
     """Return recent saved interview sessions."""
     rows = get_interview_history(limit=limit)
-
     interviews = [
         InterviewSummary(
             id=row["id"],
@@ -213,7 +334,6 @@ def list_interviews(
         )
         for row in rows
     ]
-
     return {"interviews": interviews}
 
 
@@ -221,10 +341,8 @@ def list_interviews(
 def interview_details(interview_id: int) -> dict[str, Any]:
     """Return a saved interview and its evaluated answers."""
     details = get_interview_details(interview_id)
-
     if details is None:
         raise HTTPException(status_code=404, detail="Interview not found.")
-
     return details
 
 
@@ -233,48 +351,61 @@ def interview_details(interview_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------
 
 @router.post("/interviews/start", response_model=StartInterviewResponse)
-def start_interview(
-    request: StartInterviewRequest,
-) -> dict[str, Any]:
-    """
-    Create an interview using all matching questions.
+def start_interview(request: StartInterviewRequest) -> dict[str, Any]:
+    """Start an interview with all questions belonging to a selected main topic.
 
-    The candidate does not select a question count.
-    If the chosen difficulty has no questions for the selected topic,
-    all questions for that topic are used as a fallback.
+    Subtopics are grouped behind their parent subject. The special Coding
+    Questions subject includes only the DSA subtopic families defined above.
+    If a selected difficulty has no matches, all difficulties for that main
+    subject are used as a fallback.
     """
+    selected_topic = next(
+        (
+            topic
+            for topic in MAIN_TOPICS
+            if topic.casefold() == request.topic.strip().casefold()
+        ),
+        None,
+    )
+    if selected_topic is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported topic '{request.topic}'. Choose one of: "
+                + ", ".join(MAIN_TOPICS)
+            ),
+        )
+
     question_bank = load_question_bank()
-
     topic_questions = [
         item for item in question_bank
-        if item["topic"].casefold() == request.topic.casefold()
+        if item.get("main_topic") == selected_topic
     ]
 
     if not topic_questions:
         raise HTTPException(
             status_code=404,
-            detail=f"No questions found for topic '{request.topic}'.",
+            detail=f"No questions found for topic '{selected_topic}'.",
         )
 
     matching = [
         item for item in topic_questions
         if item["difficulty"].casefold() == request.difficulty.casefold()
     ]
-
-    chosen_questions = matching if matching else topic_questions
-
-    # Randomize question order for varied practice sessions.
-    import random
-    random.shuffle(chosen_questions)
+    chosen_questions = randomize_question_order(
+        list(matching if matching else topic_questions),
+        selected_topic,
+        request.difficulty,
+    )
 
     session_id = create_interview(
-        topic=request.topic,
+        topic=selected_topic,
         difficulty=request.difficulty,
         total_questions=len(chosen_questions),
     )
 
     active_sessions[session_id] = {
-        "topic": request.topic,
+        "topic": selected_topic,
         "difficulty": request.difficulty,
         "use_web_search": request.use_web_search,
         "questions": chosen_questions,
@@ -284,7 +415,7 @@ def start_interview(
 
     return {
         "session_id": session_id,
-        "topic": request.topic,
+        "topic": selected_topic,
         "difficulty": request.difficulty,
         "total_questions": len(chosen_questions),
         "first_question": public_question(chosen_questions[0]),
@@ -295,13 +426,8 @@ def start_interview(
 # Submit answer and return the next question
 # ---------------------------------------------------------
 
-@router.post(
-    "/interviews/answer",
-    response_model=SubmitAnswerResponse,
-)
-def submit_answer(
-    request: SubmitAnswerRequest,
-) -> dict[str, Any]:
+@router.post("/interviews/answer", response_model=SubmitAnswerResponse)
+def submit_answer(request: SubmitAnswerRequest) -> dict[str, Any]:
     """Evaluate one answer, save it, and provide interview progress."""
     session_id = request.session_id
     session = active_sessions.get(session_id)
@@ -323,7 +449,6 @@ def submit_answer(
 
     questions = session["questions"]
     index = session["current_index"]
-
     if index >= len(questions):
         raise HTTPException(
             status_code=409,
@@ -331,7 +456,6 @@ def submit_answer(
         )
 
     current_question = questions[index]
-
     if str(current_question["question_id"]) != request.question_id:
         raise HTTPException(
             status_code=409,
@@ -345,15 +469,12 @@ def submit_answer(
         )
 
     try:
-        # The candidate's answer is sent to the local Ollama model.
         evaluation = evaluate_candidate_answer(
             question=current_question["question"],
             candidate_answer=request.answer.strip(),
             topic=session["topic"],
             search_enabled=session["use_web_search"],
         )
-
-        # Persist the answer only after a successful evaluation.
         save_answer(
             interview_id=session_id,
             question_id=str(current_question["question_id"]),
@@ -361,9 +482,7 @@ def submit_answer(
             candidate_answer=request.answer.strip(),
             evaluation=evaluation,
         )
-
     except Exception as exc:
-        # Preserve the session so the candidate can retry.
         logger.exception("Answer evaluation failed.")
         raise HTTPException(
             status_code=502,
@@ -376,17 +495,13 @@ def submit_answer(
 
     session["answered_question_ids"].add(request.question_id)
     session["current_index"] += 1
-
     evaluated_count = session["current_index"]
     total_questions = len(questions)
-
-    next_question = None
     interview_completed = evaluated_count >= total_questions
 
+    next_question = None
     if interview_completed:
         complete_interview(session_id)
-        # Keep the session in memory until the report is fetched or
-        # the process restarts. This also helps prevent accidental reuse.
     else:
         next_question = public_question(questions[session["current_index"]])
 
@@ -405,23 +520,16 @@ def submit_answer(
 # Finish interview early
 # ---------------------------------------------------------
 
-@router.post(
-    "/interviews/{interview_id}/finish",
-    response_model=MessageResponse,
-)
+@router.post("/interviews/{interview_id}/finish", response_model=MessageResponse)
 def finish_interview(interview_id: int) -> dict[str, str]:
     """Allow the candidate to finish early and save the partial report."""
     session = active_sessions.get(interview_id)
-
     if session is None:
         details = get_interview_details(interview_id)
-
         if details is None:
             raise HTTPException(status_code=404, detail="Interview not found.")
-
         if details["interview"]["status"] == "completed":
             return {"message": "Interview was already completed."}
-
         raise HTTPException(
             status_code=404,
             detail="Active interview session not found.",
@@ -429,5 +537,4 @@ def finish_interview(interview_id: int) -> dict[str, str]:
 
     complete_interview(interview_id)
     active_sessions.pop(interview_id, None)
-
     return {"message": "Interview completed and saved."}
