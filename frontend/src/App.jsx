@@ -33,6 +33,7 @@ import {
   Globe,
   TerminalSquare,
   Workflow,
+  Sigma,
 } from "lucide-react";
 
 const API_BASE = "http://127.0.0.1:8000/api";
@@ -54,6 +55,7 @@ const MAIN_TOPICS = [
   "Deep Learning",
   "NLP",
   "SQL",
+  "Statistics",
 ];
 
 const TOPIC_ICONS = {
@@ -71,6 +73,7 @@ const TOPIC_ICONS = {
   "Deep Learning": Layers3,
   NLP: BookOpen,
   SQL: Database,
+  Statistics: Sigma,
 };
 
 const NAVIGATION = [
@@ -394,7 +397,7 @@ function App() {
 
           {activePage === "Practice Interview" && <InterviewPage sessionId={sessionId} topic={selectedTopic} difficulty={difficulty} currentQuestion={currentQuestion} answer={answer} setAnswer={setAnswer} evaluation={evaluation} pendingQuestion={pendingQuestion} evaluations={evaluations} completed={completed} sessionAverage={sessionAverage} loading={loading} notice={notice} onSubmit={submitAnswer} onContinue={continueInterview} onFinish={finishEarly} onStartNew={startNewInterview} onDashboard={() => goToPage("Overview")} />}
 
-          {activePage === "Question Bank" && <QuestionBankPage topics={topics} questionCounts={questionCounts} onSelect={(topic) => { setSelectedTopic(topic); goToPage("Overview"); }} />}
+          {activePage === "Question Bank" && <QuestionBankPage topics={topics} questionCounts={questionCounts} onPractice={(topic) => { setSelectedTopic(topic); goToPage("Overview"); }} />}
 
           {activePage === "Interview History" && <HistoryPage history={history} />}
         </div>
@@ -499,8 +502,188 @@ function TextPanel({ title, text }) {
   return <div className="rounded-2xl border border-white/[0.07] bg-surface p-5 sm:p-6"><h3 className="mb-4 flex items-center gap-2 text-sm font-semibold"><BookOpen size={16} className="text-purple-300" />{title}</h3><p className="whitespace-pre-wrap text-xs leading-7 text-zinc-400">{text || "No answer was provided by the evaluator."}</p></div>;
 }
 
-function QuestionBankPage({ topics, questionCounts, onSelect }) {
-  return <section><PageHeading title="Question Bank" description="Browse your 14 main preparation areas. Their detailed subtopics are grouped under the relevant main topic." /><div className="mb-5 rounded-xl border border-white/[0.07] bg-surface p-4 text-xs leading-6 text-zinc-400"><strong className="text-zinc-200">Coding Questions</strong> is reserved for DSA practice only. Python, SQL, RAG, LLM, and MCP implementation questions remain in their respective main topics.</div><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">{topics.map((topic) => { const Icon = TOPIC_ICONS[topic] || BookOpen; const counts = questionCounts[topic] ?? {}; const total = countForTopic(questionCounts, topic); return <button key={topic} onClick={() => onSelect(topic)} className="flex items-center gap-4 rounded-2xl border border-white/[0.07] bg-surface p-5 text-left transition hover:border-purple-400/30"><div className="rounded-xl bg-purple-500/10 p-3 text-purple-300"><Icon size={21} /></div><div className="min-w-0 flex-1"><p className="text-sm font-medium">{topic}</p><p className="mt-1 text-xs text-zinc-500">{total} questions · Easy {counts.Easy ?? 0} · Medium {counts.Medium ?? 0} · Hard {counts.Hard ?? 0}</p></div><ArrowRight size={16} className="text-zinc-600" /></button>; })}</div></section>;
+function QuestionBankPage({ topics, questionCounts, onPractice }) {
+  // Selecting a card opens its questions here instead of redirecting to Overview.
+  const [openTopic, setOpenTopic] = useState(null);
+  const [questions, setQuestions] = useState([]);
+  const [questionLoading, setQuestionLoading] = useState(false);
+  const [questionError, setQuestionError] = useState("");
+  const [difficultyFilter, setDifficultyFilter] = useState("All");
+  const [subtopicFilter, setSubtopicFilter] = useState("All");
+  const [searchText, setSearchText] = useState("");
+
+  useEffect(() => {
+    if (!openTopic) {
+      setQuestions([]);
+      setQuestionError("");
+      return undefined;
+    }
+
+    let cancelled = false;
+    setQuestionLoading(true);
+    setQuestionError("");
+    setQuestions([]);
+
+    apiRequest(`/questions?topic=${encodeURIComponent(openTopic)}`)
+      .then((data) => {
+        if (cancelled) return;
+        setQuestions(Array.isArray(data.questions) ? data.questions : []);
+      })
+      .catch((error) => {
+        if (!cancelled) setQuestionError(error.message || "Could not load questions.");
+      })
+      .finally(() => {
+        if (!cancelled) setQuestionLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [openTopic]);
+
+  const subtopics = [...new Set(questions.map((item) => item.topic).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+  const filteredQuestions = questions.filter((item) => {
+    const matchesDifficulty = difficultyFilter === "All" || item.difficulty === difficultyFilter;
+    const matchesSubtopic = subtopicFilter === "All" || item.topic === subtopicFilter;
+    const searchable = `${item.question ?? ""} ${item.question_id ?? ""} ${item.topic ?? ""}`.toLowerCase();
+    const matchesSearch = searchable.includes(searchText.trim().toLowerCase());
+    return matchesDifficulty && matchesSubtopic && matchesSearch;
+  });
+
+  function openTopicQuestions(topic) {
+    setOpenTopic(topic);
+    setDifficultyFilter("All");
+    setSubtopicFilter("All");
+    setSearchText("");
+  }
+
+  if (openTopic) {
+    const Icon = TOPIC_ICONS[openTopic] || BookOpen;
+    const counts = questionCounts[openTopic] ?? {};
+    return (
+      <section>
+        <button
+          onClick={() => setOpenTopic(null)}
+          className="mb-5 flex items-center gap-2 text-xs text-zinc-400 transition hover:text-purple-300"
+        >
+          <ArrowLeft size={15} /> Back to all topics
+        </button>
+
+        <div className="mb-6 flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
+          <div>
+            <div className="mb-3 flex items-center gap-3">
+              <div className="rounded-xl bg-purple-500/10 p-3 text-purple-300"><Icon size={23} /></div>
+              <div>
+                <p className="text-xs text-purple-300">QUESTION BANK / TOPIC</p>
+                <h2 className="mt-1 text-2xl font-semibold tracking-tight">{openTopic}</h2>
+              </div>
+            </div>
+            <p className="text-sm text-zinc-500">
+              Browse all questions from {openTopic}, including its detailed subtopics.
+            </p>
+          </div>
+          <button
+            onClick={() => onPractice(openTopic)}
+            className="flex shrink-0 items-center justify-center gap-2 rounded-xl bg-purple-600 px-4 py-3 text-xs font-semibold text-white transition hover:bg-purple-500"
+          >
+            <Play size={14} fill="currentColor" /> Practice this topic
+          </button>
+        </div>
+
+        <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div className="rounded-xl border border-white/[0.07] bg-surface p-4">
+            <p className="text-xs text-zinc-500">Questions in topic</p>
+            <p className="mt-2 text-2xl font-semibold">{questionLoading ? "…" : questions.length}</p>
+          </div>
+          <div className="rounded-xl border border-white/[0.07] bg-surface p-4">
+            <p className="text-xs text-zinc-500">Subtopics</p>
+            <p className="mt-2 text-2xl font-semibold">{questionLoading ? "…" : subtopics.length}</p>
+          </div>
+          <div className="rounded-xl border border-white/[0.07] bg-surface p-4">
+            <p className="text-xs text-zinc-500">Currently shown</p>
+            <p className="mt-2 text-2xl font-semibold">{questionLoading ? "…" : filteredQuestions.length}</p>
+          </div>
+        </div>
+
+        <div className="mb-5 grid grid-cols-1 gap-3 rounded-2xl border border-white/[0.07] bg-surface p-4 md:grid-cols-[1.5fr_1fr_1fr]">
+          <label className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#0c0c14] px-3">
+            <BookOpen size={15} className="shrink-0 text-zinc-500" />
+            <input
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+              placeholder="Search questions..."
+              className="w-full bg-transparent py-3 text-xs text-zinc-200 outline-none placeholder:text-zinc-600"
+            />
+          </label>
+          <label className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#0c0c14] px-3">
+            <span className="text-[11px] text-zinc-500">Difficulty</span>
+            <select value={difficultyFilter} onChange={(event) => setDifficultyFilter(event.target.value)} className="min-w-0 flex-1 bg-transparent py-3 text-xs text-zinc-200 outline-none">
+              { ["All", "Easy", "Medium", "Hard"].map((level) => <option key={level} value={level} className="bg-[#12121c]">{level}</option>) }
+            </select>
+          </label>
+          <label className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#0c0c14] px-3">
+            <span className="text-[11px] text-zinc-500">Subtopic</span>
+            <select value={subtopicFilter} onChange={(event) => setSubtopicFilter(event.target.value)} className="min-w-0 flex-1 bg-transparent py-3 text-xs text-zinc-200 outline-none">
+              <option value="All" className="bg-[#12121c]">All subtopics</option>
+              {subtopics.map((subtopic) => <option key={subtopic} value={subtopic} className="bg-[#12121c]">{subtopic}</option>)}
+            </select>
+          </label>
+        </div>
+
+        {questionLoading ? (
+          <div className="flex items-center justify-center gap-3 rounded-2xl border border-white/[0.07] bg-surface p-12 text-sm text-zinc-400">
+            <LoaderCircle size={18} className="animate-spin" /> Loading {openTopic} questions...
+          </div>
+        ) : questionError ? (
+          <ErrorNotice message={questionError} />
+        ) : filteredQuestions.length ? (
+          <div className="space-y-3">
+            {filteredQuestions.map((item, index) => (
+              <article key={item.question_id} className="rounded-2xl border border-white/[0.07] bg-surface p-5 transition hover:border-purple-400/20 sm:p-6">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <span className="rounded-lg bg-purple-500/10 px-2.5 py-1 text-[10px] font-semibold text-purple-300">Question {index + 1}</span>
+                  <span className="rounded-lg border border-white/10 px-2.5 py-1 text-[10px] text-zinc-400">{item.topic}</span>
+                  <span className={`rounded-lg px-2.5 py-1 text-[10px] ${item.difficulty === "Easy" ? "bg-emerald-500/10 text-emerald-300" : item.difficulty === "Hard" ? "bg-rose-500/10 text-rose-300" : "bg-amber-500/10 text-amber-300"}`}>{item.difficulty}</span>
+                  <span className="rounded-lg border border-white/10 px-2.5 py-1 text-[10px] text-zinc-500">{(item.question_type || "conceptual").replaceAll("_", " ")}</span>
+                </div>
+                <p className="text-sm leading-7 text-zinc-200">{item.question}</p>
+                <p className="mt-3 text-[10px] text-zinc-600">ID: {item.question_id}</p>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <EmptyState icon={BookOpen} title="No matching questions" description="Try changing the difficulty, subtopic, or search term." />
+        )}
+      </section>
+    );
+  }
+
+  return (
+    <section>
+      <PageHeading title="Question Bank" description={`Browse your ${topics.length} main preparation areas. Click a topic to open all of its questions and subtopics here.`} />
+      <div className="mb-5 rounded-xl border border-white/[0.07] bg-surface p-4 text-xs leading-6 text-zinc-400">
+        <strong className="text-zinc-200">Coding Questions</strong> is reserved for DSA practice only. Python, SQL, RAG, LLM, and MCP implementation questions remain in their respective main topics.
+      </div>
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        {topics.map((topic) => {
+          const TopicIcon = TOPIC_ICONS[topic] || BookOpen;
+          const counts = questionCounts[topic] ?? {};
+          const total = countForTopic(questionCounts, topic);
+          return (
+            <button key={topic} onClick={() => openTopicQuestions(topic)} className="flex items-center gap-4 rounded-2xl border border-white/[0.07] bg-surface p-5 text-left transition hover:border-purple-400/30">
+              <div className="rounded-xl bg-purple-500/10 p-3 text-purple-300"><TopicIcon size={21} /></div>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium">{topic}</p>
+                <p className="mt-1 text-xs text-zinc-500">{total} questions · Easy {counts.Easy ?? 0} · Medium {counts.Medium ?? 0} · Hard {counts.Hard ?? 0}</p>
+                <p className="mt-2 text-[10px] text-purple-300">Browse questions <ArrowRight size={12} className="ml-1 inline" /></p>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
 }
 
 function HistoryPage({ history }) {

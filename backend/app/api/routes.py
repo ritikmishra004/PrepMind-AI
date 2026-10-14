@@ -55,6 +55,7 @@ MAIN_TOPICS = [
     "Deep Learning",
     "NLP",
     "SQL",
+    "Statistics",
 ]
 
 # These topic labels in the `coding_*` group represent DSA problem families.
@@ -74,9 +75,9 @@ DSA_SUBTOPICS = {
     "dynamic programming",
 }
 
-# The uploaded bank has detailed Statistics questions but no separate
-# machine-learning ID group. To keep the requested fixed set of main subjects,
-# these foundational questions are grouped under Machine Learning.
+# Statistics has its own question-ID group. A small set of Machine Learning
+# Engineering questions under the `aieng_*` IDs is assigned to Machine Learning
+# by its detailed subtopic in canonical_topic().
 QUESTION_ID_PREFIX_TO_MAIN_TOPIC = {
     "rag": "RAG",
     "agenticai": "Agentic AI",
@@ -87,7 +88,7 @@ QUESTION_ID_PREFIX_TO_MAIN_TOPIC = {
     "os": "Operating System",
     "networking": "Computer Networks",
     "python": "Python",
-    "statistics": "Machine Learning",
+    "statistics": "Statistics",
     "deeplearning": "Deep Learning",
     "nlp": "NLP",
 }
@@ -114,6 +115,12 @@ def canonical_topic(item: dict[str, Any]) -> str | None:
                 return "AI Engineering"
             return "Python"
         return None
+
+    # A small set of questions in the `aieng_*` group are explicitly about
+    # Machine Learning Engineering. Keep them under Machine Learning instead
+    # of grouping them all under AI Engineering just because of their ID prefix.
+    if normalized_topic == "machine learning engineering":
+        return "Machine Learning"
 
     prefix = question_id.split("_", maxsplit=1)[0]
     return QUESTION_ID_PREFIX_TO_MAIN_TOPIC.get(prefix)
@@ -303,6 +310,51 @@ def get_question_counts() -> dict[str, Any]:
         if sum(by_difficulty.values()) > 0
     }
     return {"counts": counts}
+
+
+@router.get("/questions")
+def list_topic_questions(
+    topic: str = Query(..., min_length=1, description="A main topic from /api/topics"),
+) -> dict[str, Any]:
+    """Return every question belonging to one main topic for Question Bank browsing.
+
+    The topic filter uses each question's canonical main topic, so detailed
+    labels such as Chunking or MCP Security remain visible as subtopics without
+    becoming separate top-level categories.
+    """
+    selected_topic = next(
+        (name for name in MAIN_TOPICS if name.casefold() == topic.strip().casefold()),
+        None,
+    )
+    if selected_topic is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported topic '{topic}'. Choose one of: " + ", ".join(MAIN_TOPICS),
+        )
+
+    questions = [
+        item for item in load_question_bank()
+        if item.get("main_topic") == selected_topic
+    ]
+    if not questions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No questions found for topic '{selected_topic}'.",
+        )
+
+    subtopics = sorted({str(item["topic"]) for item in questions}, key=str.casefold)
+    return {
+        "topic": selected_topic,
+        "total": len(questions),
+        "subtopics": subtopics,
+        "questions": [
+            {
+                **public_question(item),
+                "main_topic": selected_topic,
+            }
+            for item in questions
+        ],
+    }
 
 
 # ---------------------------------------------------------
